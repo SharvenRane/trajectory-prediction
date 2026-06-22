@@ -1,51 +1,76 @@
+"""A small LSTM sequence model for trajectory prediction.
+
+The model encodes the observed positions with an LSTM, then rolls out the
+future positions one step at a time. To make learning easier and to keep the
+model translation invariant, we predict step to step displacements relative to
+the last observed point rather than absolute coordinates.
 """
-Trajectory Prediction - Model Architecture
-"""
+
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
-import timm
-from einops import rearrange
 
 
-class TrajectoryPrediction(nn.Module):
-    """
-    Main model for trajectory prediction.
-    """
-
-    def __init__(self, config):
+class TrajectoryLSTM(nn.Module):
+    def __init__(
+        self,
+        input_dim: int = 2,
+        hidden_dim: int = 64,
+        num_layers: int = 1,
+        pred_len: int = 12,
+    ):
         super().__init__()
-        self.config = config
-        self.encoder = timm.create_model(
-            config.backbone,
-            pretrained=config.pretrained,
-            features_only=True
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.pred_len = pred_len
+
+        self.encoder = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
         )
-        self.head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(self.encoder.feature_info[-1]["num_chs"], config.num_classes)
-        )
+        self.decoder_cell = nn.LSTMCell(input_dim, hidden_dim)
+        self.readout = nn.Linear(hidden_dim, input_dim)
 
-    def forward(self, x):
-        features = self.encoder(x)
-        out = self.head(features[-1])
-        return out
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        """Predict future positions from observed positions.
 
-    def extract_features(self, x):
-        features = self.encoder(x)
-        pooled = nn.functional.adaptive_avg_pool2d(features[-1], 1)
-        return pooled.flatten(1)
+        ``obs`` has shape ``(batch, obs_len, 2)``. Returns predicted future
+        positions of shape ``(batch, pred_len, 2)`` in the same absolute
+        coordinate frame as ``obs``.
+        """
+        if obs.dim() != 3 or obs.size(-1) != self.input_dim:
+            raise ValueError(
+                f"expected obs of shape (batch, obs_len, {self.input_dim}), "
+                f"got {tuple(obs.shape)}"
+            )
 
+        batch = obs.size(0)
+        # The encoder works on step to step velocities so the model does not
+        # have to memorize absolute position. The first velocity is zero.
+        vel = torch.zeros_like(obs)
+        vel[:, 1:, :] = obs[:, 1:, :] - obs[:, :-1, :]
 
-def build_model(config):
-    model = TrajectoryPrediction(config)
-    if config.get("checkpoint"):
-        state = torch.load(config.checkpoint, map_location="cpu")
-        model.load_state_dict(state["model"])
-    return model
+        _, (h, c) = self.encoder(vel)
+        # take the top layer hidden and cell state to seed the decoder
+        h_dec = h[-1]
+        c_dec = c[-1]
 
-# update 3
+        last_pos = obs[:, -1, :]  # (batch, 2)
+        last_vel = vel[:, -1, :]  # (batch, 2)
 
-# update 10
+        outputs = []
+        cur_pos = last_pos
+        step_in = last_vel
+        for _ in range(self.pred_len):
+            h_dec, c_dec = self.decoder_cell(step_in, (h_dec, c_dec))
+            delta = self.readout(h_dec)  # predicted velocity for this step
+            cur_pos = cur_pos + delta
+            outputs.append(cur_pos)
+            step_in = delta
 
-# update 12
+        pred = torch.stack(outputs, dim=1)  # (batch, pred_len, 2)
+        return pred
